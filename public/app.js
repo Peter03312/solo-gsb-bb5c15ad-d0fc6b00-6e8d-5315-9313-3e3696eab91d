@@ -427,6 +427,142 @@ async function doPublish(formData, basisVersion) {
   }
 }
 
+// ---- 档期规划：搜索可用起始日并选定改期 ----
+$('#scheduleFormBtn').addEventListener('click', async () => {
+  const b = readPkgForm();
+  if (!b.packageId) {
+    toast('请先「保存待发布包」，再搜索档期（档期搜索只针对已保存的待发布包）', true);
+    return;
+  }
+  await openScheduleSearch(b.packageId);
+});
+
+async function openScheduleSearch(packageId) {
+  // 始终以服务端当前包参数为准（展期天数取自包当前展期，无需信任表单）
+  let pkg;
+  try {
+    pkg = await api('GET', `/api/packages/${packageId}`);
+  } catch (err) { toast(errText(err), true); return; }
+
+  $('#modalTitle').textContent = `档期搜索：${pkg.name} #${pkg.id}`;
+  $('#modalBody').innerHTML = `
+    <div class="edit-banner">
+      <span>展期天数按包当前展期（含首尾）：<b>${pkg.useFrom} → ${pkg.useTo}</b></span>
+      <span class="small-muted">媒介 ${esc(pkg.medium)} ｜ 地区 ${esc(pkg.region)} ｜ 素材 ${pkg.itemCount} 项</span>
+    </div>
+    <div class="mini" style="align-items:flex-end">
+      <label class="pick-label" style="margin:0">规划窗口起
+        <input type="date" id="planFrom" value="${pkg.useFrom || ''}" />
+      </label>
+      <label class="pick-label" style="margin:0">规划窗口止
+        <input type="date" id="planTo" value="${pkg.useTo || ''}" />
+      </label>
+      <button class="btn btn-primary btn-small" id="scheduleSearchBtn">搜索可用起始日</button>
+    </div>
+    <div id="scheduleResult" class="schedule-result" style="margin-top:10px"></div>`;
+  const foot = $('#modalFoot');
+  foot.classList.remove('hidden');
+  foot.innerHTML = `<button class="btn" id="scheduleCancel">关闭</button>`;
+  $('#scheduleCancel').addEventListener('click', () => $('#modalBackdrop').classList.add('hidden'));
+  $('#modalBackdrop').classList.remove('hidden');
+
+  $('#scheduleSearchBtn').addEventListener('click', async () => {
+    const planFrom = $('#planFrom').value;
+    const planTo = $('#planTo').value;
+    const box = $('#scheduleResult');
+    box.innerHTML = '<div class="small-muted">搜索中…</div>';
+    try {
+      const r = await api('POST', `/api/packages/${packageId}/schedule/search`, { planFrom, planTo });
+      renderScheduleResult(packageId, r);
+    } catch (err) {
+      box.innerHTML = `<div class="errorline">${esc(errText(err))}</div>`;
+    }
+  });
+
+  // 默认直接搜索一次
+  $('#scheduleSearchBtn').click();
+}
+
+function scheduleRangeHtml(packageId, r, idx) {
+  const multi = r.startFrom !== r.startTo;
+  return `
+    <div class="schedule-range">
+      <div class="schedule-range-head">
+        <b>${esc(r.startFrom)}${multi ? ` → ${esc(r.startTo)}` : ''}</b>
+        <span class="small-muted">${multi ? `共 ${r.dayCount || ''} 个连续可行起始日` : '单日可行'}</span>
+        <span class="pill pill-ok">最早展期 ${r.earliestExhibitionFrom} → ${r.earliestExhibitionTo}</span>
+      </div>
+      <div class="mini" style="margin-top:4px">
+        <label class="pick-label" style="margin:0">选定起始日
+          <input type="date" id="pickStart_${idx}" min="${r.startFrom}" max="${r.startTo}" value="${r.startFrom}" />
+        </label>
+        <button class="btn btn-primary btn-small" data-range-idx="${idx}">按此档期改期</button>
+      </div>
+    </div>`;
+}
+
+function renderScheduleResult(packageId, r) {
+  const box = $('#scheduleResult');
+  const head = r.windowTooShort
+    ? `<div class="verdict fail">规划窗口放不下 ${r.durationDays} 天的展期（含首尾），无可用档期。<span class="sub">${esc(r.message || '')}</span></div>`
+    : (r.feasible
+      ? `<div class="verdict pass">✓ 找到 ${r.ranges.length} 段连续可行起始日（展期固定 ${r.durationDays} 天，含首尾；每段给出最早展期）。
+           <span class="sub">核验依据版本 ${r.basisVersion} ｜ 规划窗口 ${r.planFrom} → ${r.planTo} ｜ 选定后将在事务内重验，授权/包变化则拒绝改期</span></div>`
+      : `<div class="verdict fail">✗ 规划窗口内无可行起始日（交集为空）。<span class="sub">${esc(r.message || '')}</span></div>`);
+
+  const ranges = r.feasible ? r.ranges.map((x, i) => scheduleRangeHtml(packageId, x, i)).join('') : '';
+
+  const restricted = (!r.feasible && !r.windowTooShort && r.restrictedNodes.length) ? `
+    <div class="section-title">各受限节点在窗口内的可用起始日范围（取交集后为空）</div>
+    <table class="auth">
+      <tr><th>节点</th><th>限制原因</th><th>窗口内可用起始日范围</th></tr>
+      ${r.restrictedNodes.map((n) => `
+        <tr>
+          <td>${esc(n.title)} <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span></td>
+          <td>${n.reasonText ? `<span class="pill pill-bad">${esc(n.reasonText)}</span>` : '<span class="small-muted">—</span>'}</td>
+          <td>${n.ranges.length
+            ? n.ranges.map((x) => `<span class="chip">${x.startFrom} → ${x.startTo}</span>`).join('')
+            : '<span class="pill pill-bad">窗口内无可用起始日</span>'}</td>
+        </tr>`).join('')}
+    </table>` : '';
+
+  box.innerHTML = head + ranges + restricted;
+
+  if (r.feasible) {
+    box.querySelectorAll('button[data-range-idx]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const idx = Number(btn.dataset.rangeIdx);
+        const range = r.ranges[idx];
+        const useFrom = $(`#pickStart_${idx}`).value;
+        if (!useFrom || useFrom < range.startFrom || useFrom > range.startTo) {
+          toast(`请在 ${range.startFrom} 至 ${range.startTo} 之间选择起始日`, true);
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const out = await api('POST', `/api/packages/${packageId}/schedule/apply`, {
+            useFrom,
+            searchToken: r.searchToken,
+          });
+          $('#modalBackdrop').classList.add('hidden');
+          await loadState();
+          toast(`档期已更新：${out.useFrom} → ${out.useTo}（展期 ${out.durationDays} 天，含首尾）`);
+        } catch (err) {
+          btn.disabled = false;
+          if (err.status === 409 && err.details && (err.details.code === 'STALE_BASIS' || err.details.code === 'PACKAGE_CHANGED' || err.details.code === 'SLOT_INVALID')) {
+            toast(`${err.message} 请重新搜索档期`, true);
+            await loadState();
+            // 以最新数据重新打开搜索
+            await openScheduleSearch(packageId);
+          } else {
+            toast('改期被拒绝：' + errText(err), true);
+          }
+        }
+      });
+    });
+  }
+}
+
 // ---- 包列表 ----
 const STATUS_TEXT = { draft: '待发布', published: '已发布', needs_review: '需复核' };
 
@@ -442,6 +578,7 @@ function renderPackages() {
         <div class="pkg-actions">
           ${p.status === 'draft' ? `<button class="btn btn-small" data-act="edit">编辑</button>` : ''}
           ${p.status === 'draft' ? `<button class="btn btn-small btn-primary" data-act="to-verify">去核验</button>` : ''}
+          ${p.status === 'draft' ? `<button class="btn btn-small" data-act="schedule">档期搜索</button>` : ''}
           ${p.status === 'needs_review' ? `<button class="btn btn-small btn-primary" data-act="recheck">重新核验（人工复核）</button>` : ''}
           <button class="btn btn-small" data-act="snapshot">查看最新快照</button>
           <button class="btn btn-small" data-act="copy">复制为待发布包</button>
@@ -491,6 +628,8 @@ $('#packagesList').addEventListener('click', async (e) => {
       await loadState();
       renderVerify(r.result, { packageId: id }, 'recheck');
       toast(r.message, !r.restored);
+    } else if (btn.dataset.act === 'schedule') {
+      await openScheduleSearch(id);
     } else if (btn.dataset.act === 'del') {
       if (!confirm('删除该待发布包？')) return;
       await api('DELETE', `/api/packages/${id}`);

@@ -343,6 +343,7 @@ module.exports = {
   scopeMatches,
   loadGraph,
   findPath,
+  collectChains,
   basisVersion,
   verifyPackage,
   revalidatePublished,

@@ -115,6 +115,10 @@ tr.revoked td { text-decoration: line-through; color: #a0a8b4; }
 .impact-pkg { border: 1px solid #e2e5ea; border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
 .impact-pkg h4 { margin: 0 0 4px; font-size: 14px; }
 .impact-node { background: #fde8e6; border-radius: 6px; padding: 6px 10px; margin: 6px 0; font-size: 12.5px; color: #9b1c14; }
+.schedule-result table.auth td .chip { margin: 0 4px 4px 0; }
+.schedule-range { border: 1px solid #cfe3d6; background: #f4faf6; border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
+.schedule-range-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13.5px; }
+.schedule-range-head b { font-size: 14px; color: #14663a; }
 .edit-banner { background: #eef2f7; border: 1px solid #d7dee8; border-radius: 8px; padding: 8px 12px; font-size: 13px; color: #46505c; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .mini .revoked-edit { width: auto; }
 pre.json { background: #0f172a; color: #dbeafe; padding: 12px; border-radius: 8px; font-size: 12px; overflow: auto; }

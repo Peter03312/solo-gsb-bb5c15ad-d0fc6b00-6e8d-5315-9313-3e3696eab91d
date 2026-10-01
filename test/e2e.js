@@ -366,6 +366,173 @@ async function call(method, url, body) {
       '既有 PATCH /api/authorizations/:id 兼容可用');
   }
 
+  console.log('11) 档期规划：可行起始日搜索（展期天数含首尾、整窗覆盖、单份授权不拼接）');
+  {
+    // 独立链：sRoot -> sSrc，展期固定 7 天（含首尾）
+    const m1 = (await call('POST', '/api/materials', { title: '档期-成片', kind: 'video' })).data.id;
+    const m2 = (await call('POST', '/api/materials', { title: '档期-来源', kind: 'audio' })).data.id;
+    await call('POST', `/api/materials/${m1}/sources`, { sourceMaterialId: m2, relation: '配乐' });
+    // root：07-01~08-15 覆盖 -> 起始日可行区间 [07-01, 08-09]
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-07-01', validTo: '2026-08-15', licensor: 'r',
+    });
+    // source：07-10~08-31 -> [07-10, 08-25]；交集应为 [07-10, 08-09]
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-07-10', validTo: '2026-08-31', licensor: 's',
+    });
+    // source 另有一份仅 5 天的短授权（09-01~09-05），展期 7 天，不能与任何授权拼接
+    await call('POST', `/api/materials/${m2}/authorizations`, {
+      media: '屏幕放映', region: '中国大陆', validFrom: '2026-09-01', validTo: '2026-09-05', licensor: 'short',
+    });
+    const pid = (await call('POST', '/api/packages', {
+      name: '档期规划包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-07-10', useTo: '2026-07-16', materialIds: [m1],
+    })).data.id;
+    global.schedPid = pid; global.schedRoot = m1; global.schedSrc = m2;
+
+    const sr = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    ok(sr.status === 200 && sr.data.feasible === true, '档期搜索 200 且有结果');
+    ok(sr.data.durationDays === 7, '展期天数按当前展期（含首尾）= 7');
+    ok(sr.data.ranges.length === 1 &&
+       sr.data.ranges[0].startFrom === '2026-07-10' && sr.data.ranges[0].startTo === '2026-08-09',
+      '两节点可行起始日取交集并合并为一段 07-10 → 08-09，实际: ' + JSON.stringify(sr.data.ranges));
+    ok(sr.data.ranges[0].dayCount === 31, '该段含 31 个连续可行起始日');
+    ok(sr.data.ranges[0].earliestExhibitionFrom === '2026-07-10' &&
+       sr.data.ranges[0].earliestExhibitionTo === '2026-07-16',
+      '列出最早展期 07-10 → 07-16');
+    ok(sr.data.restrictedNodes.length === 0, '有结果时不列受限节点');
+    ok(sr.data.searchToken && sr.data.searchToken.basisVersion === sr.data.basisVersion &&
+       sr.data.searchToken.durationDays === 7,
+      '返回含依据版本与天数的搜索令牌');
+
+    // 展期完整落在窗口内：06-01 虽在窗口内但 root 授权 07-01 才开始 -> 不属于可行段
+    const sr2 = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-08-01', planTo: '2026-08-07' });
+    ok(sr2.data.ranges.length === 1 && sr2.data.ranges[0].startFrom === '2026-08-01' && sr2.data.ranges[0].startTo === '2026-08-01',
+      '窗口仅放得下一天起始日（展期止恰好窗口止）时返回单日段');
+
+    // 窗口短于展期
+    const short = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-09-01', planTo: '2026-09-03' });
+    ok(short.status === 200 && short.data.feasible === false && short.data.windowTooShort === true,
+      '窗口不足展期天数：无结果且标记 windowTooShort');
+
+    // 9 月窗口：root 无覆盖；source 虽有短授权但不足 7 天，不能拼接 -> 无结果，列受限节点
+    const sept = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-09-01', planTo: '2026-09-30' });
+    ok(sept.data.feasible === false, '9 月窗口无可行起始日（短授权不可拼接）');
+    const septIds = sept.data.restrictedNodes.map((n) => n.materialId).sort();
+    ok(septIds.join() === `${m1},${m2}`, '无结果时列出全部受限节点（root + source）');
+    const septSrc = sept.data.restrictedNodes.find((n) => n.materialId === m2);
+    ok(septSrc.reason === 'date' && septSrc.ranges.length === 0,
+      'source 的 5 天短授权折算为空区间，原因 date（不跨授权拼接）');
+    const septRoot = sept.data.restrictedNodes.find((n) => n.materialId === m1);
+    ok(septRoot.reason === 'date' && septRoot.ranges.length === 0, 'root 在窗口内无任何覆盖，区间为空');
+
+    // 非法窗口 / 空包 / 已发布包
+    const badWin = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-09-10', planTo: '2026-09-01' });
+    ok(badWin.status === 400 && badWin.data.details.code === 'INVALID_WINDOW', '非法窗口（起晚于止）报 400 INVALID_WINDOW');
+    const badFmt = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-02-30', planTo: '2026-09-01' });
+    ok(badFmt.status === 400, '非法日历日期报 400');
+    const emptyPkg = (await call('POST', '/api/packages', {
+      name: '档期空包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-07-10', useTo: '2026-07-16', materialIds: [],
+    })).data.id;
+    const emptySr = await call('POST', `/api/packages/${emptyPkg}/schedule/search`, { planFrom: '2026-09-01', planTo: '2026-09-30' });
+    ok(emptySr.status === 400 && emptySr.data.details.code === 'EMPTY_PACKAGE', '空包搜索档期报 400 EMPTY_PACKAGE');
+    const pubPkg = (await call('GET', '/api/packages')).data.find((p) => p.name.includes('预演测试包'))
+      || (await call('GET', '/api/packages')).data.find((p) => p.status === 'published');
+    if (pubPkg) {
+      const pubSr = await call('POST', `/api/packages/${pubPkg.id}/schedule/search`, { planFrom: '2026-01-01', planTo: '2026-12-31' });
+      ok(pubSr.status === 409 && pubSr.data.details.code === 'NOT_DRAFT', '已发布/需复核包不可搜索档期');
+    }
+  }
+
+  console.log('12) 档期应用：事务内重验（依据/清单参数/状态/档期失效），拒绝不改包');
+  {
+    const pid = global.schedPid, m1 = global.schedRoot, m2 = global.schedSrc;
+    const before = await call('GET', `/api/packages/${pid}`);
+    ok(before.data.useFrom === '2026-07-10' && before.data.useTo === '2026-07-16', '前置：包仍为原档期');
+
+    // 正常应用交集边界起始日 08-09（展期 08-09 → 08-15）
+    const sr = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    const token = sr.data.searchToken;
+    const ap = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-09', searchToken: token });
+    ok(ap.status === 200 && ap.data.useFrom === '2026-08-09' && ap.data.useTo === '2026-08-15' && ap.data.durationDays === 7,
+      '选定起始日应用成功，展期天数保持 7 天（含首尾）');
+    const after = await call('GET', `/api/packages/${pid}`);
+    ok(after.data.status === 'draft', '改期后包仍为待发布（不发布、不写快照）');
+    ok(after.data.itemCount === 1 && after.data.items[0].id === m1, '改期不改变素材清单');
+
+    // 同一令牌重复使用：包参数（展期）已变 -> PACKAGE_CHANGED
+    const reuse = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-08', searchToken: token });
+    ok(reuse.status === 409 && reuse.data.details.code === 'PACKAGE_CHANGED', '令牌一次性：改期后旧令牌被拒 PACKAGE_CHANGED');
+
+    // STALE_BASIS：搜索后授权变更
+    const sr2 = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    await call('POST', `/api/materials/${m1}/authorizations`, {
+      media: '网络', region: '中国大陆', validFrom: '2030-01-01', validTo: '2030-12-31', licensor: 'x',
+    });
+    const stale = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-01', searchToken: sr2.data.searchToken });
+    ok(stale.status === 409 && stale.data.details.code === 'STALE_BASIS', '搜索后授权变更 -> 409 STALE_BASIS');
+    const unchangedAfterStale = await call('GET', `/api/packages/${pid}`);
+    ok(unchangedAfterStale.data.useFrom === '2026-08-09', 'STALE 拒绝后包档期不变');
+
+    // PACKAGE_CHANGED：搜索后改清单
+    const sr3 = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    await call('PATCH', `/api/packages/${pid}`, {
+      name: '档期规划包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-08-09', useTo: '2026-08-15', materialIds: [m1, m2],
+    });
+    const changed = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-01', searchToken: sr3.data.searchToken });
+    ok(changed.status === 409 && changed.data.details.code === 'PACKAGE_CHANGED', '搜索后清单变更 -> 409 PACKAGE_CHANGED');
+
+    // 恢复清单
+    await call('PATCH', `/api/packages/${pid}`, {
+      name: '档期规划包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-08-09', useTo: '2026-08-15', materialIds: [m1],
+    });
+
+    // SLOT_INVALID：撤销覆盖授权后选定档期失效（令牌依据版本需要未变 -> 用“不改授权”的另一种方式：
+    // 直接构造窗口外起始日 / 展期落出窗口）
+    const sr4 = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-07-31' });
+    const outOfWin = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-01', searchToken: sr4.data.searchToken });
+    ok(outOfWin.status === 409 && outOfWin.data.details.code === 'SLOT_INVALID',
+      '选定起始日落在搜索窗口之外 -> 409 SLOT_INVALID');
+
+    // 档期失效：搜索后撤销授权（依据版本也变，按 STALE_BASIS 优先拒绝——因此改用“窗口内但授权不覆盖”的真实档期）
+    const sr5 = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    const invalidSlot = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-09-01', searchToken: sr5.data.searchToken });
+    ok(invalidSlot.status === 409 && invalidSlot.data.details.code === 'SLOT_INVALID' &&
+       Array.isArray(invalidSlot.data.details.failingNodes) && invalidSlot.data.details.failingNodes.length > 0,
+      '选定无授权覆盖的起始日 -> 409 SLOT_INVALID 并附失效节点');
+
+    // 非法选定日期 / 缺令牌
+    const badDate = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: 'not-a-date', searchToken: sr5.data.searchToken });
+    ok(badDate.status === 400, '选定日期格式非法报 400');
+    const noToken = await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: '2026-08-01' });
+    ok(noToken.status === 400, '缺少搜索令牌报 400');
+    const wrongPkg = await call('POST', `/api/packages/${pid}/schedule/apply`, {
+      useFrom: '2026-08-01', searchToken: { ...sr5.data.searchToken, packageId: pid + 9999 },
+    });
+    ok(wrongPkg.status === 409 && wrongPkg.data.details.code === 'TOKEN_MISMATCH', '令牌与目标包不一致 -> 409 TOKEN_MISMATCH');
+  }
+
+  console.log('13) 改期后既有核验/发布链路兼容');
+  {
+    const pid = global.schedPid;
+    // 改到一个全链合格的档期并发布
+    const sr = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-06-01', planTo: '2026-09-30' });
+    const target = sr.data.ranges[0].startFrom;
+    await call('POST', `/api/packages/${pid}/schedule/apply`, { useFrom: target, searchToken: sr.data.searchToken });
+    const v = await call('POST', '/api/verify', { packageId: pid });
+    ok(v.data.eligible === true && v.data.request.useFrom === target, '改期后按新档期核验合格');
+    const pub = await call('POST', `/api/packages/${pid}/publish`, { basisVersion: v.data.basisVersion });
+    ok(pub.status === 201 && pub.data.package.status === 'published' &&
+       pub.data.package.useFrom === target,
+      '改期后的待发布包可正常发布，发布快照记录新档期');
+    // 已发布包再改期被拒
+    const again = await call('POST', `/api/packages/${pid}/schedule/search`, { planFrom: '2026-01-01', planTo: '2026-12-31' });
+    ok(again.status === 409 && again.data.details.code === 'NOT_DRAFT', '发布后再搜索档期被拒');
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

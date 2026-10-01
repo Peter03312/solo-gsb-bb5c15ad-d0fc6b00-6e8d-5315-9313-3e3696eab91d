@@ -11,6 +11,7 @@ const {
   revalidatePublished,
 } = require('./verify');
 const { previewChange, commitChange, ChangeError } = require('./changes');
+const { searchSchedule, applySchedule, ScheduleError } = require('./schedule');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -547,6 +548,33 @@ app.post('/api/packages/:id/recheck', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 档期规划：搜索可用起始日 / 选定并应用到待发布包 ----------
+app.post('/api/packages/:id/schedule/search', (req, res, next) => {
+  try {
+    const result = searchSchedule(db, { ...(req.body || {}), packageId: Number(req.params.id) });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/packages/:id/schedule/apply', (req, res, next) => {
+  try {
+    const out = applySchedule(db, {
+      ...(req.body || {}),
+      packageId: Number(req.params.id),
+    });
+    const pkg = db.prepare('SELECT * FROM packages WHERE id=?').get(out.packageId);
+    res.json({
+      ok: true,
+      message: `档期已更新：${out.useFrom} → ${out.useTo}（展期 ${out.durationDays} 天，含首尾）。`,
+      useFrom: out.useFrom,
+      useTo: out.useTo,
+      durationDays: out.durationDays,
+      basisVersion: out.basisVersion,
+      package: packageDTO(pkg, true),
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 变更影响预演 / 确认提交（馆员对单笔授权或单条来源关系先预演再确认） ----------
 // 请求字段沿用对应既有编辑接口；预演只读不落库，确认在事务内核版本、重算并比对影响清单。
 app.post('/api/changes/preview', (req, res, next) => {
@@ -597,7 +625,7 @@ app.get('/api/snapshots/:id', (req, res, next) => {
 
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError || err instanceof ChangeError) {
+  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {
