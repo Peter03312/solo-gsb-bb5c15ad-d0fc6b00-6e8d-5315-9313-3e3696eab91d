@@ -366,6 +366,210 @@ async function call(method, url, body) {
       '既有 PATCH /api/authorizations/:id 兼容可用');
   }
 
+  console.log('11) 档期搜索 + 选定档期（待发布包，事务内重验）');
+  {
+    // 独立素材链：sA(root) -> sB, sA -> sC（无环）；展期取 30 天（含首尾）
+    const sA = (await call('POST', '/api/materials', { title: '档期-成片', kind: 'video' })).data.id;
+    const sB = (await call('POST', '/api/materials', { title: '档期-来源B', kind: 'audio' })).data.id;
+    const sC = (await call('POST', '/api/materials', { title: '档期-来源C', kind: 'image' })).data.id;
+    await call('POST', `/api/materials/${sA}/sources`, { sourceMaterialId: sB, relation: '配乐' });
+    await call('POST', `/api/materials/${sA}/sources`, { sourceMaterialId: sC, relation: '画面' });
+    await call('POST', `/api/materials/${sA}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-01-01', validTo: '2026-12-31', licensor: 'A',
+    });
+    await call('POST', `/api/materials/${sB}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-03-01', validTo: '2026-05-31', licensor: 'B',
+    });
+    // C：两段互不相邻的短授权，演示同一节点短授权不可拼接（各 30 天，30 天展期下各只支持 1 个起始日）
+    await call('POST', `/api/materials/${sC}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-03-01', validTo: '2026-03-30', licensor: 'C1',
+    });
+    await call('POST', `/api/materials/${sC}/authorizations`, {
+      media: '*', region: '*', validFrom: '2026-04-11', validTo: '2026-05-10', licensor: 'C2',
+    });
+    // 另加一条媒介不匹配的长授权，验证媒介匹配参与判断
+    await call('POST', `/api/materials/${sC}/authorizations`, {
+      media: '广播', region: '*', validFrom: '2026-01-01', validTo: '2026-12-31', licensor: 'CX',
+    });
+    const pkg = (await call('POST', '/api/packages', {
+      name: '档期测试包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-01-01', useTo: '2026-01-30', materialIds: [sA],
+    })).data.id;
+    global.schedPkg = pkg; global.schedA = sA; global.schedB = sB; global.schedC = sC;
+
+    // 11.1 搜索：D=30，候选域 01-01~12-02；B 起始日 03-01~05-02；
+    //   C 由 C1 得 03-01 前 1 天（03-01 当天起、30 天展期最晚 03-20 止 => 仅 03-01），
+    //   由 C2 得 04-11 当天（最晚 04-30 止 => 仅 04-11）；交集仅 03-01 与 04-11
+    const r = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(r.status === 200 && r.data.feasible === true, '档期搜索成功且可行');
+    ok(r.data.durationDays === 30 && r.data.candidateFrom === '2026-01-01' && r.data.candidateTo === '2026-12-02',
+      '展期含首尾 30 天，候选起始日域按窗口-(D-1) 计算');
+    const starts = r.data.ranges.map((g) => `${g.startFrom}..${g.startTo}`).join(',');
+    ok(starts === '2026-03-01..2026-03-01,2026-04-11..2026-04-11',
+      '合并连续起始日后为两个孤立可行日（同节点短授权未被拼接），实际: ' + starts);
+    ok(r.data.ranges[0].earliestUseFrom === '2026-03-01' && r.data.ranges[0].earliestUseTo === '2026-03-30',
+      '首段最早展期为起始日 +D-1');
+    const cNode = r.data.nodes.find((n) => n.materialId === sC);
+    ok(cNode.blocking === false && cNode.ranges.map((x) => `${x.from}..${x.to}`).join(',') === '2026-03-01..2026-03-01,2026-04-11..2026-04-11',
+      '受限节点 C 逐授权贡献各自可行起始日（不拼接）');
+    ok(typeof r.data.packageFingerprint === 'string' && r.data.packageFingerprint.length === 64,
+      '返回包参数/清单指纹');
+    global.schedBasis = r.data.basisVersion;
+    global.schedFp = r.data.packageFingerprint;
+
+    // 11.2 窗口缩到秋季：无可行起始日，逐节点给出窗口内范围并标出受限节点
+    const r2 = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-09-01', windowTo: '2026-11-30',
+    });
+    ok(r2.status === 200 && r2.data.feasible === false, '秋季窗口无可行起始日');
+    ok(r2.data.blockedBy.includes(sB) && r2.data.blockedBy.includes(sC),
+      '受限节点为 B、C（交集为空的原因）');
+    const b2 = r2.data.nodes.find((n) => n.materialId === sB);
+    ok(b2.blocking === true && b2.ranges.length === 0, 'B 在窗口内可用起始日范围为空');
+    const a2 = r2.data.nodes.find((n) => n.materialId === sA);
+    ok(a2.blocking === false && a2.ranges[0].from === '2026-09-01',
+      '非受限节点 A 仍列出窗口内候选范围用于解释交集');
+
+    // 11.3 窗口短于展期：windowTooShort，候选域为空
+    const r3 = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-03-01', windowTo: '2026-03-20',
+    });
+    ok(r3.status === 200 && r3.data.feasible === false && r3.data.windowTooShort === true &&
+       r3.data.candidateFrom === null && r3.data.blockedBy.length === 0,
+      '规划窗口短于展期天数时提示窗口过短（非报错）');
+
+    // 11.4 非法窗口 / 空包 / 无效原展期 / 非待发布包 -> 4xx
+    const badWin = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-12-31', windowTo: '2026-01-01',
+    });
+    ok(badWin.status === 400 && badWin.data.details.code === 'INVALID_WINDOW', '倒置窗口 400 INVALID_WINDOW');
+    const badFmt = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-02-30', windowTo: '2026-12-01',
+    });
+    ok(badFmt.status === 400, '非法日历日期窗口 400');
+    const emptyPkg = (await call('POST', '/api/packages', {
+      name: '档期空包', medium: '屏幕放映', region: '中国大陆',
+      useFrom: '2026-01-01', useTo: '2026-01-30', materialIds: [],
+    })).data.id;
+    const emptySearch = await call('POST', `/api/packages/${emptyPkg}/schedules/search`, {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(emptySearch.status === 400 && emptySearch.data.details.code === 'EMPTY_PACKAGE', '空包搜索 400 EMPTY_PACKAGE');
+    const published = global.pidGood;
+    const pubSearch = await call('POST', `/api/packages/${published}/schedules/search`, {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(pubSearch.status === 409 && pubSearch.data.details.code === 'NOT_DRAFT', '已发布包不可搜索档期 409');
+    const noPkg = await call('POST', '/api/packages/999999/schedules/search', {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(noPkg.status === 404, '不存在包搜索 404');
+
+    // 直接写库制造无效原展期
+    {
+      const Database = require('better-sqlite3');
+      const db = new Database(process.env.DB_PATH || '/workspace/data/app.db');
+      const id2 = db.prepare(
+        "INSERT INTO packages(name,medium,region,use_from,use_to,status,created_at,updated_at) VALUES('档期坏展期','屏幕放映','中国大陆','2026-05-01','2026-04-01','draft',datetime('now'),datetime('now'))"
+      ).run().lastInsertRowid;
+      db.prepare('INSERT INTO package_items(package_id,material_id,position) VALUES(?,?,0)').run(id2, sA);
+      db.close();
+      const badDur = await call('POST', `/api/packages/${id2}/schedules/search`, {
+        windowFrom: '2026-01-01', windowTo: '2026-12-31',
+      });
+      ok(badDur.status === 400 && badDur.data.details.code === 'INVALID_DURATION', '无效原展期 400 INVALID_DURATION');
+    }
+
+    // 11.5 正常应用首个可行起始日 03-01：展期 03-01~03-30，包被改期
+    const ap = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-03-01', basisVersion: global.schedBasis, packageFingerprint: global.schedFp,
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(ap.status === 200 && ap.data.applied.useFrom === '2026-03-01' && ap.data.applied.useTo === '2026-03-30',
+      '选定档期已应用到待发布包（含首尾 30 天）');
+    ok(ap.data.package.status === 'draft' && ap.data.package.useFrom === '2026-03-01',
+      '应用后包仍为待发布且起止日已更新');
+
+    // 11.6 旧指纹再次应用 -> PACKAGE_CHANGED，包保持不变
+    const staleFp = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-04-11', basisVersion: ap.data.basisVersion, packageFingerprint: global.schedFp,
+    });
+    ok(staleFp.status === 409 && staleFp.data.details.code === 'PACKAGE_CHANGED',
+      '搜索后包参数变化，旧档期应用被拒 PACKAGE_CHANGED');
+    const unchanged = await call('GET', `/api/packages/${pkg}`);
+    ok(unchanged.data.useFrom === '2026-03-01' && unchanged.data.useTo === '2026-03-30', '拒绝后包未改动');
+
+    // 11.7 搜索后授权变化 -> STALE_BASIS，拒绝且不改包
+    const r4 = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    await call('POST', `/api/materials/${sA}/authorizations`, {
+      media: '广播', region: '*', validFrom: '2030-01-01', validTo: '2030-12-31', licensor: 'noop',
+    });
+    const staleBasis = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-03-01', basisVersion: r4.data.basisVersion, packageFingerprint: r4.data.packageFingerprint,
+    });
+    ok(staleBasis.status === 409 && staleBasis.data.details.code === 'STALE_BASIS',
+      '搜索后授权变化，应用被拒 STALE_BASIS 且不改包');
+
+    // 11.8 选定档期落在窗口外 / 授权不覆盖 -> SLOT_INVALID
+    const r5 = await call('POST', `/api/packages/${pkg}/schedules/search`, {
+      windowFrom: '2026-03-01', windowTo: '2026-05-31',
+    });
+    // 03-01 在该窗口可行（展期到 03-30）；改成 05-10 起：超出窗口（窗口截止 05-31 < 展期止）
+    const outWin = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-05-10', basisVersion: r5.data.basisVersion, packageFingerprint: r5.data.packageFingerprint,
+      windowFrom: '2026-03-01', windowTo: '2026-05-31',
+    });
+    ok(outWin.status === 409 && outWin.data.details.code === 'SLOT_INVALID' &&
+       outWin.data.details.reason === 'out_of_window',
+      '展期不完整落在规划窗口内 -> SLOT_INVALID out_of_window');
+    // 不带窗口时，05-10 起 C 无覆盖（C1/C2 均不覆盖 05-10~06-08）-> not_eligible
+    const notCov = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-05-10', basisVersion: r5.data.basisVersion, packageFingerprint: r5.data.packageFingerprint,
+    });
+    ok(notCov.status === 409 && notCov.data.details.code === 'SLOT_INVALID' &&
+       notCov.data.details.reason === 'not_eligible' &&
+       notCov.data.details.failingNodes.some((n) => n.materialId === sC),
+      '授权不覆盖选定档期 -> SLOT_INVALID not_eligible 并返回不合格节点');
+    const still2 = await call('GET', `/api/packages/${pkg}`);
+    ok(still2.data.useFrom === '2026-03-01' && still2.data.useTo === '2026-03-30', '档期失效拒绝后包仍未改动');
+    ok(!still2.data.snapshots || still2.data.snapshots.length === 0, '应用档期不产生核验快照');
+
+    // 11.9 应用非法参数 -> 400
+    const badStart = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-13-01', basisVersion: r5.data.basisVersion, packageFingerprint: r5.data.packageFingerprint,
+    });
+    ok(badStart.status === 400 && badStart.data.details.code === 'INVALID_START', '非法起始日 400');
+    const missBasis = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-03-01', packageFingerprint: r5.data.packageFingerprint,
+    });
+    ok(missBasis.status === 400, '缺 basisVersion 400');
+
+    // 11.10 改期后的待发布包可正常核验与发布；已发布后不可再改期
+    const vf = await call('POST', '/api/verify', { packageId: pkg });
+    ok(vf.data.eligible === true, '改期后待发布包核验合格');
+    const pub = await call('POST', `/api/packages/${pkg}/publish`, { basisVersion: vf.data.basisVersion });
+    ok(pub.status === 201, '改期后的包发布成功');
+    const pubApply = await call('POST', `/api/packages/${pkg}/schedules/apply`, {
+      start: '2026-04-11', basisVersion: pub.data.result.basisVersion,
+      packageFingerprint: 'x',
+    });
+    ok(pubApply.status === 409 && pubApply.data.details.code === 'STATUS_CHANGED',
+      '已发布包改期被拒 STATUS_CHANGED，发布快照与既有接口不受影响');
+
+    // 11.11 搜索结果包含全部上游节点（入展品 + B + C）
+    const draftCopy = (await call('POST', `/api/packages/1/copy`)).data.id;
+    const rcNodes = await call('POST', `/api/packages/${draftCopy}/schedules/search`, {
+      windowFrom: '2026-01-01', windowTo: '2026-12-31',
+    });
+    ok(rcNodes.status === 200 && [1, 2, 3, 4, 5].every((id) =>
+      rcNodes.data.nodes.some((n) => n.materialId === id)),
+      '搜索逐节点覆盖入展品及全部上游来源节点');
+  }
+
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });

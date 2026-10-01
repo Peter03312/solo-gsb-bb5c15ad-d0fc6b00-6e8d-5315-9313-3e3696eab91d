@@ -442,6 +442,7 @@ function renderPackages() {
         <div class="pkg-actions">
           ${p.status === 'draft' ? `<button class="btn btn-small" data-act="edit">编辑</button>` : ''}
           ${p.status === 'draft' ? `<button class="btn btn-small btn-primary" data-act="to-verify">去核验</button>` : ''}
+          ${p.status === 'draft' ? `<button class="btn btn-small" data-act="schedule">🔍 搜索档期</button>` : ''}
           ${p.status === 'needs_review' ? `<button class="btn btn-small btn-primary" data-act="recheck">重新核验（人工复核）</button>` : ''}
           <button class="btn btn-small" data-act="snapshot">查看最新快照</button>
           <button class="btn btn-small" data-act="copy">复制为待发布包</button>
@@ -486,6 +487,8 @@ $('#packagesList').addEventListener('click', async (e) => {
       fillPkgForm(copy);
       toast('已复制为新的待发布包');
       window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else if (btn.dataset.act === 'schedule') {
+      await openScheduleSearch(id);
     } else if (btn.dataset.act === 'recheck') {
       const r = await api('POST', `/api/packages/${id}/recheck`);
       await loadState();
@@ -638,6 +641,141 @@ async function commitPreviewedChange(change, preview, sourceForm) {
       openChangePreview(change, note, sourceForm);
     } else {
       toast('提交被拒绝：' + errText(err), true);
+    }
+  }
+}
+
+// ---- 档期搜索 / 选定档期（仅待发布包） ----
+function fmtRangeDays(r) {
+  return r.from === r.to ? `${r.from}（1 天）` : `${r.from} → ${r.to}（${r.days} 天）`;
+}
+
+// 打开档期搜索弹层：默认以包当前展期的日期范围初始化规划窗口
+async function openScheduleSearch(packageId) {
+  const pkg = await api('GET', `/api/packages/${packageId}`);
+  $('#modalTitle').textContent = `档期搜索：${pkg.name} #${pkg.id}`;
+  $('#modalBody').innerHTML = `
+    <div class="edit-banner">
+      <span>当前展期：<b>${pkg.useFrom} → ${pkg.useTo}</b> ｜ 媒介：${esc(pkg.medium)} ｜ 地区：${esc(pkg.region)} ｜ 素材 ${pkg.itemCount} 项</span>
+    </div>
+    <form id="schedForm" class="mini" style="margin:6px 0 10px">
+      <label>规划起始 <input type="date" name="windowFrom" required value="${pkg.useFrom}" /></label>
+      <label>规划截止 <input type="date" name="windowTo" required value="${pkg.useTo}" /></label>
+      <button class="btn btn-primary btn-small" type="submit">搜索可行起始日</button>
+    </form>
+    <div id="schedResult" class="small-muted">展期天数（含首尾）由包当前起止日决定；搜索会保持该天数，寻找完整落在规划窗口内的起始日。</div>`;
+  const foot = $('#modalFoot');
+  foot.classList.add('hidden');
+  foot.innerHTML = '';
+  $('#modalBackdrop').classList.remove('hidden');
+
+  $('#schedForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button');
+    btn.disabled = true;
+    try {
+      const result = await api('POST', `/api/packages/${packageId}/schedules/search`, {
+        windowFrom: e.target.windowFrom.value,
+        windowTo: e.target.windowTo.value,
+      });
+      renderScheduleResult(packageId, result);
+    } catch (err) {
+      toast('档期搜索被拒绝：' + errText(err), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function renderScheduleResult(packageId, r) {
+  const box = $('#schedResult');
+  const head = `
+    <div class="small-muted" style="margin-bottom:8px">
+      展期 <b>${r.durationDays}</b> 天（含首尾）｜规划窗口 ${r.windowFrom} → ${r.windowTo}（${r.windowDays} 天）
+      ${r.windowTooShort ? '' : `｜候选起始日 ${r.candidateFrom} → ${r.candidateTo}`}
+      ｜依据版本 <b>${r.basisVersion}</b>
+    </div>`;
+
+  if (r.windowTooShort) {
+    box.innerHTML = head + `
+      <div class="verdict fail">规划窗口仅 ${r.windowDays} 天，短于包当前展期 ${r.durationDays} 天，不存在能完整落入的起始日。</div>`;
+    return;
+  }
+
+  if (r.feasible) {
+    box.innerHTML = head + `
+      <div class="verdict pass">✓ 找到 ${r.ranges.length} 段可行起始日（按日期升序合并连续日期）。选定一个起始日应用到待发布包。</div>
+      ${r.ranges.map((seg, i) => `
+        <div class="sched-seg">
+          <div class="sched-seg-main">
+            起始日 <b>${seg.startFrom} → ${seg.startTo}</b>（连续 ${seg.days} 天）
+            <span class="small-muted">最早展期 ${seg.earliestUseFrom} → ${seg.earliestUseTo}</span>
+          </div>
+          <div class="sched-pick">
+            <input type="date" id="schedStart${i}" value="${seg.startFrom}" min="${seg.startFrom}" max="${seg.startTo}" />
+            <button class="btn btn-primary btn-small" data-seg="${i}">选定此起始日</button>
+          </div>
+        </div>`).join('')}`;
+    box.querySelectorAll('button[data-seg]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const input = box.querySelector(`#schedStart${btn.dataset.seg}`);
+        doApplySchedule(packageId, r, input.value);
+      });
+    });
+    return;
+  }
+
+  // 无结果：列出各受限节点在窗口内的可用起始日范围以解释交集
+  box.innerHTML = head + `
+    <div class="verdict fail">✗ 规划窗口内无可行起始日（全部节点可用起始日交集为空）。</div>
+    <div class="section-title">各来源链节点在窗口内的可用起始日范围（受限节点标红）</div>
+    <table class="auth">
+      <tr><th>节点</th><th>结论</th><th>窗口内可用起始日范围</th></tr>
+      ${r.nodes.map((n) => `
+        <tr class="${n.blocking ? 'sched-block-row' : ''}">
+          <td>${esc(n.title)} <span class="small-muted">#${n.materialId}${n.isRoot ? '（入展品）' : ''}</span></td>
+          <td>${n.blocking
+            ? '<span class="pill pill-bad">窗口内无单份授权覆盖整段展期</span>'
+            : '<span class="pill pill-ok">窗口内可覆盖</span>'}</td>
+          <td>${n.ranges.length
+            ? n.ranges.map((rg) => `<span class="chip">${esc(fmtRangeDays(rg))}</span>`).join('')
+            : '<span class="small-muted">—（空）</span>'}</td>
+        </tr>`).join('')}
+    </table>
+    <div class="small-muted" style="margin-top:6px">
+      受限节点（空集合）：${r.blockedBy.length ? r.blockedBy.map((id) => `#${id}`).join('、') : '无'}。
+      每个节点只允许同一份未撤销、媒介与地区匹配的授权独自覆盖整段展期，短授权不跨份拼接。
+    </div>`;
+}
+
+async function doApplySchedule(packageId, search, start) {
+  if (!start) { toast('请先选择起始日', true); return; }
+  const foot = $('#modalFoot');
+  foot.classList.remove('hidden');
+  foot.innerHTML = '<span class="small-muted">正在事务内重验并应用…</span>';
+  try {
+    const r = await api('POST', `/api/packages/${packageId}/schedules/apply`, {
+      start,
+      basisVersion: search.basisVersion,
+      packageFingerprint: search.packageFingerprint,
+      windowFrom: search.windowFrom,
+      windowTo: search.windowTo,
+    });
+    $('#modalBackdrop').classList.add('hidden');
+    foot.classList.add('hidden');
+    await loadState();
+    toast(`档期已应用：${r.applied.useFrom} → ${r.applied.useTo}（${r.applied.durationDays} 天，含首尾）`);
+  } catch (err) {
+    foot.innerHTML = '';
+    foot.classList.add('hidden');
+    if (err.status === 409 && err.details && (err.details.code === 'STALE_BASIS' ||
+        err.details.code === 'PACKAGE_CHANGED' || err.details.code === 'SLOT_INVALID' ||
+        err.details.code === 'STATUS_CHANGED')) {
+      $('#modalBackdrop').classList.add('hidden');
+      toast(`档期已失效，未改包：${err.message} 请重新搜索后再选定。`, true);
+      await loadState();
+    } else {
+      toast('应用被拒绝：' + errText(err), true);
     }
   }
 }

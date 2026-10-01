@@ -122,3 +122,10 @@ pre.json { background: #0f172a; color: #dbeafe; padding: 12px; border-radius: 8p
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1f2430; color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13.5px; z-index: 100; max-width: 80vw; }
 .toast.err { background: #9b1c14; }
 .small-muted { font-size: 12px; color: #8791a0; }
+
+/* 档期搜索 */
+.sched-seg { border: 1px solid #cfe2d6; background: #f3faf5; border-radius: 8px; padding: 9px 12px; margin: 8px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sched-seg-main { font-size: 13.5px; }
+.sched-seg-main b { color: #14663a; }
+.sched-pick { display: inline-flex; gap: 6px; align-items: center; }
+tr.sched-block-row td { background: #fde8e6; color: #9b1c14; }

@@ -11,6 +11,7 @@ const {
   revalidatePublished,
 } = require('./verify');
 const { previewChange, commitChange, ChangeError } = require('./changes');
+const { searchSchedules, applySchedule, ScheduleError } = require('./schedule');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -547,6 +548,40 @@ app.post('/api/packages/:id/recheck', (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 档期搜索 / 应用（仅待发布包；事务内重验，已发布/需复核不可改期） ----------
+app.post('/api/packages/:id/schedules/search', (req, res, next) => {
+  try {
+    const body = { ...(req.body || {}), packageId: Number(req.params.id) };
+    const result = searchSchedules(db, body);
+    res.json({
+      ok: true,
+      message: result.feasible
+        ? `在规划窗口内找到 ${result.ranges.length} 段可行起始日（展期 ${result.durationDays} 天，含首尾）。`
+        : result.windowTooShort
+          ? '规划窗口短于包当前展期天数，不存在可完整落入的起始日。'
+          : '规划窗口内无可行起始日：下列受限节点的可用起始日交集为空。',
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/packages/:id/schedules/apply', (req, res, next) => {
+  try {
+    const body = { ...(req.body || {}), packageId: Number(req.params.id) };
+    const out = applySchedule(db, body);
+    res.status(200).json({
+      ok: true,
+      message: `已把选定档期应用到待发布包：${out.applied.useFrom} → ${out.applied.useTo}（${out.applied.durationDays} 天，含首尾）。`,
+      packageId: out.packageId,
+      applied: out.applied,
+      basisVersion: out.basisVersion,
+      packageFingerprint: out.packageFingerprint,
+      package: packageDTO(out.pkg, true),
+      result: out.result,
+    });
+  } catch (e) { next(e); }
+});
+
 // ---------- 变更影响预演 / 确认提交（馆员对单笔授权或单条来源关系先预演再确认） ----------
 // 请求字段沿用对应既有编辑接口；预演只读不落库，确认在事务内核版本、重算并比对影响清单。
 app.post('/api/changes/preview', (req, res, next) => {
@@ -597,7 +632,7 @@ app.get('/api/snapshots/:id', (req, res, next) => {
 
 // ---------- 错误处理 ----------
 app.use((err, req, res, next) => {
-  if (err instanceof HttpError || err instanceof ChangeError) {
+  if (err instanceof HttpError || err instanceof ChangeError || err instanceof ScheduleError) {
     return res.status(err.status).json({ error: err.message, details: err.details });
   }
   if (err && err.code === 'SQLITE_CONSTRAINT_TRIGGER') {

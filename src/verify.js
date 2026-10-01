@@ -343,8 +343,11 @@ module.exports = {
   scopeMatches,
   loadGraph,
   findPath,
+  collectChains,
   basisVersion,
   verifyPackage,
   revalidatePublished,
   REASON_TEXT,
+  MAX_PATH_INSTANCES,
+  MAX_CHAIN_DEPTH,
 };
